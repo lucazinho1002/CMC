@@ -1,178 +1,220 @@
-import javax.swing.*;
-import java.awt.*;
-import java.awt.event.*;
-import java.awt.image.BufferedImage;
-import java.awt.image.DataBufferInt;
-import java.io.*;
+package com.lucpastc.cmc.app;
 
-public class client extends JFrame {
+import android.annotation.SuppressLint;
+import android.content.Context;
+import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.os.Bundle;
+import android.os.Handler;
+import android.view.MotionEvent;
+import android.view.View;
+import android.widget.Button;
+import android.widget.FrameLayout;
+import androidx.appcompat.app.AppCompatActivity;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+
+public class ClientActivity extends AppCompatActivity {
 
     private String caminhoMapa;
-    
+
     private final int LARGURA_RENDER = 320;
     private final int ALTURA_RENDER = 240;
 
-    private BufferedImage imagem;
+    private Bitmap imagem;
     private int[] pixels;
 
-    // Posição do Jogador
     private double posX = 5.5;
     private double posY = 5.5;
-    private double posZ = 1.0; 
+    private double posZ = 1.0;
     private double velZ = 0.0;
     private boolean noChao = true;
 
-    // Olhar em 3D
     private double dirX = -1.0, dirY = 0.0;
     private double planeX = 0.0, planeY = 0.66;
     private double pitch = 0.0;
 
-    // Controles
     private boolean keyW, keyS, keyA, keyD;
     private boolean inventarioAberto = false;
     private int blocoSelecionado = 1;
 
-    // Mapa 3D
     private final int MAP_WIDTH = 24;
     private final int MAP_HEIGHT = 24;
     private final int MAP_DEPTH = 5;
     private final int[][][] mapa = new int[MAP_WIDTH][MAP_HEIGHT][MAP_DEPTH];
 
-    private Robot robot;
+    private float lastTouchX, lastTouchY;
+    private PainelRender painelRender;
+    private Handler loopHandler = new Handler();
+    private Runnable loopRunnable;
 
-    public client(String caminhoMapa) {
-        this.caminhoMapa = caminhoMapa;
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
 
-        setTitle("CollectionsMinecraft - 3D Engine (" + caminhoMapa + ")");
-        setSize(854, 480);
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setLocationRelativeTo(null);
-        setResizable(false);
+        caminhoMapa = getIntent().getStringExtra("caminhoMapa");
+        if (caminhoMapa == null) {
+            caminhoMapa = new File(getExternalFilesDir(null), "maps/Mundo/map.json").getAbsolutePath();
+        }
 
-        imagem = new BufferedImage(LARGURA_RENDER, ALTURA_RENDER, BufferedImage.TYPE_INT_RGB);
-        pixels = ((DataBufferInt) imagem.getRaster().getDataBuffer()).getData();
+        imagem = Bitmap.createBitmap(LARGURA_RENDER, ALTURA_RENDER, Bitmap.Config.ARGB_8888);
+        pixels = new int[LARGURA_RENDER * ALTURA_RENDER];
 
         if (!carregarMapaJson()) {
             gerarMapaInicial();
             salvarMapaJson();
         }
 
-        setCursor(getToolkit().createCustomCursor(
-                new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB), new Point(0, 0), "null"));
+        FrameLayout layoutPrincipal = new FrameLayout(this);
+        painelRender = new PainelRender(this);
+        layoutPrincipal.addView(painelRender);
 
-        try {
-            robot = new Robot();
-        } catch (AWTException e) {
-            e.printStackTrace();
+        View controlesOverlay = getLayoutInflater().inflate(R.layout.overlay_controles, null);
+        layoutPrincipal.addView(controlesOverlay);
+
+        setContentView(layoutPrincipal);
+
+        configurarBotoesTouch(controlesOverlay);
+
+        loopRunnable = new Runnable() {
+            @Override
+            public void run() {
+                atualizarJogador();
+                renderizar3D();
+                painelRender.invalidate();
+                loopHandler.postDelayed(this, 16);
+            }
+        };
+        loopHandler.post(loopRunnable);
+    }
+
+    private void configurarBotoesTouch(View root) {
+        configurarTouchBotao(root.findViewById(R.id.btnW), val -> keyW = val);
+        configurarTouchBotao(root.findViewById(R.id.btnS), val -> keyS = val);
+        configurarTouchBotao(root.findViewById(R.id.btnA), val -> keyA = val);
+        configurarTouchBotao(root.findViewById(R.id.btnD), val -> keyD = val);
+
+        Button btnPular = root.findViewById(R.id.btnPular);
+        btnPular.setOnClickListener(v -> {
+            if (noChao) {
+                velZ = 0.20;
+                noChao = false;
+            }
+        });
+
+        Button btnQuebrar = root.findViewById(R.id.btnQuebrar);
+        btnQuebrar.setOnClickListener(v -> acaoQuebrar());
+
+        Button btnColocar = root.findViewById(R.id.btnColocar);
+        btnColocar.setOnClickListener(v -> acaoColocar());
+
+        Button btnInventario = root.findViewById(R.id.btnInventario);
+        btnInventario.setOnClickListener(v -> inventarioAberto = !inventarioAberto);
+
+        Button btnBloco1 = root.findViewById(R.id.btnBloco1);
+        Button btnBloco2 = root.findViewById(R.id.btnBloco2);
+        Button btnBloco3 = root.findViewById(R.id.btnBloco3);
+
+        btnBloco1.setOnClickListener(v -> blocoSelecionado = 1);
+        btnBloco2.setOnClickListener(v -> blocoSelecionado = 2);
+        btnBloco3.setOnClickListener(v -> blocoSelecionado = 3);
+
+        Button btnSair = root.findViewById(R.id.btnSair);
+        btnSair.setOnClickListener(v -> {
+            salvarMapaJson();
+            loopHandler.removeCallbacks(loopRunnable);
+            Intent intent = new Intent(ClientActivity.this, SpActivity.class);
+            startActivity(intent);
+            finish();
+        });
+    }
+
+    private interface BotaoState {
+        void onChange(boolean pressionado);
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private void configurarTouchBotao(View btn, BotaoState state) {
+        btn.setOnTouchListener((v, event) -> {
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_DOWN:
+                    state.onChange(true);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    state.onChange(false);
+                    return true;
+            }
+            return false;
+        });
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        if (inventarioAberto) return super.onTouchEvent(event);
+
+        float x = event.getX();
+        float y = event.getY();
+
+        switch (event.getAction()) {
+            case MotionEvent.ACTION_DOWN:
+                lastTouchX = x;
+                lastTouchY = y;
+                break;
+            case MotionEvent.ACTION_MOVE:
+                float dx = x - lastTouchX;
+                float dy = y - lastTouchY;
+
+                double rotSpeed = dx * -0.005;
+                double oldDirX = dirX;
+                dirX = dirX * Math.cos(rotSpeed) - dirY * Math.sin(rotSpeed);
+                dirY = oldDirX * Math.sin(rotSpeed) + dirY * Math.cos(rotSpeed);
+
+                double oldPlaneX = planeX;
+                planeX = planeX * Math.cos(rotSpeed) - planeY * Math.sin(rotSpeed);
+                planeY = oldPlaneX * Math.sin(rotSpeed) + planeY * Math.cos(rotSpeed);
+
+                pitch -= dy * 0.8;
+                if (pitch > 120) pitch = 120;
+                if (pitch < -120) pitch = -120;
+
+                lastTouchX = x;
+                lastTouchY = y;
+                break;
         }
+        return true;
+    }
 
-        PainelRender painel = new PainelRender();
-        add(painel);
-
-        // Teclado
-        addKeyListener(new KeyAdapter() {
-            @Override
-            public void keyPressed(KeyEvent e) {
-                int code = e.getKeyCode();
-                if (code == KeyEvent.VK_W) keyW = true;
-                if (code == KeyEvent.VK_S) keyS = true;
-                if (code == KeyEvent.VK_A) keyA = true;
-                if (code == KeyEvent.VK_D) keyD = true;
-
-                if (code == KeyEvent.VK_SPACE && noChao) {
-                    velZ = 0.20;
-                    noChao = false;
-                }
-
-                if (code == KeyEvent.VK_E) inventarioAberto = !inventarioAberto;
-                if (code == KeyEvent.VK_1) blocoSelecionado = 1;
-                if (code == KeyEvent.VK_2) blocoSelecionado = 2;
-                if (code == KeyEvent.VK_3) blocoSelecionado = 3;
-
-                if (code == KeyEvent.VK_ESCAPE) {
-                    salvarMapaJson();
-                    try {
-                        new ProcessBuilder("java", "sp.java").start();
-                    } catch (IOException ex) {
-                        ex.printStackTrace();
-                    }
-                    dispose();
-                }
+    private void acaoQuebrar() {
+        if (inventarioAberto) return;
+        int[] alvo = raycastMira3D();
+        if (alvo != null) {
+            int bx = alvo[0], by = alvo[1], bz = alvo[2];
+            if (bz >= 0 && bz < MAP_DEPTH) {
+                mapa[bx][by][bz] = 0;
+                salvarMapaJson();
             }
+        }
+    }
 
-            @Override
-            public void keyReleased(KeyEvent e) {
-                int code = e.getKeyCode();
-                if (code == KeyEvent.VK_W) keyW = false;
-                if (code == KeyEvent.VK_S) keyS = false;
-                if (code == KeyEvent.VK_A) keyA = false;
-                if (code == KeyEvent.VK_D) keyD = false;
+    private void acaoColocar() {
+        if (inventarioAberto) return;
+        int[] alvo = raycastMira3D();
+        if (alvo != null) {
+            int nx = alvo[3], ny = alvo[4], nz = alvo[5];
+            if (nx >= 0 && nx < MAP_WIDTH && ny >= 0 && ny < MAP_HEIGHT && nz >= 0 && nz < MAP_DEPTH) {
+                mapa[nx][ny][nz] = blocoSelecionado;
+                salvarMapaJson();
             }
-        });
-
-        // Mouse
-        addMouseMotionListener(new MouseMotionAdapter() {
-            @Override
-            public void mouseMoved(MouseEvent e) {
-                if (inventarioAberto) return;
-
-                int centroX = getX() + getWidth() / 2;
-                int centroY = getY() + getHeight() / 2;
-
-                int dx = e.getXOnScreen() - centroX;
-                int dy = e.getYOnScreen() - centroY;
-
-                if (dx != 0 || dy != 0) {
-                    double rotSpeed = dx * -0.003;
-                    double oldDirX = dirX;
-                    dirX = dirX * Math.cos(rotSpeed) - dirY * Math.sin(rotSpeed);
-                    dirY = oldDirX * Math.sin(rotSpeed) + dirY * Math.cos(rotSpeed);
-
-                    double oldPlaneX = planeX;
-                    planeX = planeX * Math.cos(rotSpeed) - planeY * Math.sin(rotSpeed);
-                    planeY = oldPlaneX * Math.sin(rotSpeed) + planeY * Math.cos(rotSpeed);
-
-                    pitch -= dy * 0.8;
-                    if (pitch > 120) pitch = 120;
-                    if (pitch < -120) pitch = -120;
-
-                    robot.mouseMove(centroX, centroY);
-                }
-            }
-        });
-
-        // Clique
-        addMouseListener(new MouseAdapter() {
-            @Override
-            public void mousePressed(MouseEvent e) {
-                if (inventarioAberto) return;
-
-                int[] alvo = raycastMira3D();
-                if (alvo != null) {
-                    int bx = alvo[0], by = alvo[1], bz = alvo[2];
-                    int nx = alvo[3], ny = alvo[4], nz = alvo[5];
-
-                    if (e.getButton() == MouseEvent.BUTTON3) {
-                        if (bz >= 0 && bz < MAP_DEPTH) {
-                            mapa[bx][by][bz] = 0;
-                            salvarMapaJson();
-                        }
-                    } else if (e.getButton() == MouseEvent.BUTTON1) {
-                        if (nx >= 0 && nx < MAP_WIDTH && ny >= 0 && ny < MAP_HEIGHT && nz >= 0 && nz < MAP_DEPTH) {
-                            mapa[nx][ny][nz] = blocoSelecionado;
-                            salvarMapaJson();
-                        }
-                    }
-                }
-            }
-        });
-
-        Timer timer = new Timer(16, e -> {
-            atualizarJogador();
-            renderizar3D();
-            painel.repaint();
-        });
-        timer.start();
+        }
     }
 
     private void gerarMapaInicial() {
@@ -191,7 +233,6 @@ public class client extends JFrame {
         if (inventarioAberto) return;
 
         double moveSpeed = 0.08;
-
         int px = (int) posX;
         int py = (int) posY;
         int alturaBlocoChao = 0;
@@ -245,15 +286,13 @@ public class client extends JFrame {
     }
 
     private void renderizar3D() {
-        int corCeu = 0x78B4FF;
+        int corCeu = 0xFF78B4FF;
         int horizonte = (int) (ALTURA_RENDER / 2 + pitch);
 
-        // Limpa a tela com o Céu
         for (int i = 0; i < pixels.length; i++) {
             pixels[i] = corCeu;
         }
 
-        // Desenha APENAS o chão (Abaixo do horizonte)
         for (int y = Math.max(0, horizonte); y < ALTURA_RENDER; y++) {
             int p = y - horizonte;
             if (p == 0) continue;
@@ -277,10 +316,10 @@ public class client extends JFrame {
 
                 if (cellX >= 0 && cellX < MAP_WIDTH && cellY >= 0 && cellY < MAP_HEIGHT) {
                     int tipoChao = mapa[cellX][cellY][0];
-                    int corChao = 0x338833; // Grama
+                    int corChao = 0xFF338833;
 
-                    if (tipoChao == 2) corChao = 0x9B5523; // Terra
-                    else if (tipoChao == 3) corChao = 0xAAAAAA; // Pedra
+                    if (tipoChao == 2) corChao = 0xFF9B5523;
+                    else if (tipoChao == 3) corChao = 0xFFAAAAAA;
 
                     pixels[y * LARGURA_RENDER + x] = corChao;
                 }
@@ -290,7 +329,6 @@ public class client extends JFrame {
             }
         }
 
-        // Desenha Paredes dos Blocos
         for (int z = 0; z < MAP_DEPTH; z++) {
             for (int x = 0; x < LARGURA_RENDER; x++) {
                 double cameraX = 2 * x / (double) LARGURA_RENDER - 1;
@@ -347,12 +385,12 @@ public class client extends JFrame {
                     if (drawEnd >= ALTURA_RENDER) drawEnd = ALTURA_RENDER - 1;
 
                     int tipo = mapa[mapX][mapY][z];
-                    int corBloco = 0x888888;
-                    if (tipo == 1) corBloco = 0x228B22;
-                    else if (tipo == 2) corBloco = 0x8B4513;
+                    int corBloco = 0xFF888888;
+                    if (tipo == 1) corBloco = 0xFF228B22;
+                    else if (tipo == 2) corBloco = 0xFF8B4513;
 
                     if (side == 1) {
-                        corBloco = (corBloco >> 1) & 0x7F7F7F;
+                        corBloco = (corBloco & 0xFF000000) | ((corBloco >> 1) & 0x007F7F7F);
                     }
 
                     for (int y = drawStart; y <= drawEnd; y++) {
@@ -361,6 +399,7 @@ public class client extends JFrame {
                 }
             }
         }
+        imagem.setPixels(pixels, 0, LARGURA_RENDER, 0, 0, LARGURA_RENDER, ALTURA_RENDER);
     }
 
     private int[] raycastMira3D() {
@@ -449,45 +488,53 @@ public class client extends JFrame {
         }
     }
 
-    private class PainelRender extends JPanel {
-        @Override
-        protected void paintComponent(Graphics g) {
-            super.paintComponent(g);
+    private class PainelRender extends View {
+        private Paint paint = new Paint();
 
-            g.drawImage(imagem, 0, 0, getWidth(), getHeight(), null);
+        public PainelRender(Context context) {
+            super(context);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+
+            canvas.drawBitmap(imagem, null, new android.graphics.Rect(0, 0, getWidth(), getHeight()), paint);
 
             // Mira (+)
-            g.setColor(Color.WHITE);
+            paint.setColor(Color.WHITE);
+            paint.setStrokeWidth(3);
             int cx = getWidth() / 2;
             int cy = getHeight() / 2;
-            g.drawLine(cx - 10, cy, cx + 10, cy);
-            g.drawLine(cx, cy - 10, cx, cy + 10);
+            canvas.drawLine(cx - 20, cy, cx + 20, cy, paint);
+            canvas.drawLine(cx, cy - 20, cx, cy + 20, paint);
 
             // Hotbar
-            g.setColor(new Color(0, 0, 0, 180));
-            g.fillRect(getWidth() / 2 - 120, getHeight() - 50, 240, 40);
-            g.setColor(Color.WHITE);
+            paint.setColor(Color.argb(180, 0, 0, 0));
+            canvas.drawRect(getWidth() / 2f - 200, getHeight() - 100, getWidth() / 2f + 200, getHeight() - 20, paint);
+            paint.setColor(Color.WHITE);
+            paint.setTextSize(36);
             String nomeBloco = (blocoSelecionado == 1) ? "Grama" : (blocoSelecionado == 2) ? "Terra" : "Pedra";
-            g.drawString("Bloco Ativo [1-3]: " + nomeBloco, getWidth() / 2 - 90, getHeight() - 25);
+            canvas.drawText("Bloco Ativo [1-3]: " + nomeBloco, getWidth() / 2f - 180, getHeight() - 45, paint);
 
             // Inventário (E)
             if (inventarioAberto) {
-                g.setColor(new Color(0, 0, 0, 220));
-                g.fillRect(200, 100, 454, 200);
+                paint.setColor(Color.argb(220, 0, 0, 0));
+                canvas.drawRect(100, 100, getWidth() - 100, getHeight() - 100, paint);
 
-                g.setColor(Color.WHITE);
-                g.setFont(new Font("Arial", Font.BOLD, 18));
-                g.drawString("INVENTÁRIO (Teclas 1, 2 ou 3)", 240, 140);
+                paint.setColor(Color.WHITE);
+                paint.setTextSize(40);
+                canvas.drawText("INVENTÁRIO (Toque nos botões 1, 2 ou 3)", 140, 160, paint);
 
-                g.setColor(new Color(34, 139, 34)); g.fillRect(250, 180, 50, 50);
-                g.setColor(new Color(139, 69, 19)); g.fillRect(330, 180, 50, 50);
-                g.setColor(Color.GRAY);            g.fillRect(410, 180, 50, 50);
+                paint.setColor(Color.rgb(34, 139, 34));
+                canvas.drawRect(200, 220, 300, 320, paint);
+
+                paint.setColor(Color.rgb(139, 69, 19));
+                canvas.drawRect(340, 220, 440, 320, paint);
+
+                paint.setColor(Color.GRAY);
+                canvas.drawRect(480, 220, 580, 320, paint);
             }
         }
-    }
-
-    public static void main(String[] args) {
-        String mapa = (args.length > 0) ? args[0] : "maps/Mundo/map.json";
-        SwingUtilities.invokeLater(() -> new client(mapa).setVisible(true));
     }
 }
